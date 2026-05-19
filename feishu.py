@@ -30,6 +30,43 @@ async def get_tenant_access_token() -> str:
         return _token_cache["value"]
 
 
+_user_name_cache: dict[str, str] = {}
+
+
+async def get_user_name(open_id: str) -> str:
+    """根据 open_id 查飞书联系人，返回姓名。失败时返回 open_id 后 8 位作为兜底。
+
+    需要应用具备「通讯录」相关权限（contact:user.base:readonly 或更高）。
+    结果会缓存到进程退出，避免每条消息都打一次接口。
+    """
+    if not open_id:
+        return "?"
+    if open_id in _user_name_cache:
+        return _user_name_cache[open_id]
+
+    token = await get_tenant_access_token()
+    fallback = open_id[-8:]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{FEISHU_BASE}/contact/v3/users/{open_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"user_id_type": "open_id"},
+            )
+            data = resp.json()
+        if data.get("code") != 0:
+            print(f"[feishu] get user name failed ({fallback}): {data}")
+            _user_name_cache[open_id] = fallback
+            return fallback
+        name = data.get("data", {}).get("user", {}).get("name") or fallback
+        _user_name_cache[open_id] = name
+        return name
+    except Exception as e:
+        print(f"[feishu] get user name error ({fallback}): {e}")
+        _user_name_cache[open_id] = fallback
+        return fallback
+
+
 async def reply_text(message_id: str, text: str) -> str | None:
     token = await get_tenant_access_token()
     async with httpx.AsyncClient(timeout=10) as client:

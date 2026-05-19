@@ -5,8 +5,6 @@ load_dotenv()
 
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
-FEISHU_VERIFICATION_TOKEN = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
-FEISHU_ENCRYPT_KEY = os.getenv("FEISHU_ENCRYPT_KEY", "")
 
 DIFY_API_BASE = os.getenv("DIFY_API_BASE", "https://api.dify.ai/v1").rstrip("/")
 DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
@@ -30,16 +28,12 @@ COMMAND_TO_APP: dict[str, str] = {
     # "/translate": "translate",
 }
 
-PORT = int(os.getenv("PORT", "8000"))
-
-
 def assert_ready() -> None:
     missing = [
         name
         for name, val in {
             "FEISHU_APP_ID": FEISHU_APP_ID,
             "FEISHU_APP_SECRET": FEISHU_APP_SECRET,
-            "FEISHU_VERIFICATION_TOKEN": FEISHU_VERIFICATION_TOKEN,
             "DIFY_API_KEY": DIFY_API_KEY,
         }.items()
         if not val

@@ -1,29 +1,28 @@
 import asyncio
 import json
 import re
+import threading
 import time
 import traceback
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Request
+import lark_oapi as lark
+from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 
 from commands import APP_COMMANDS, HELP_TEXT, LOCAL_COMMANDS, parse_command
 from config import (
     COMMAND_TO_APP,
     DIFY_APPS,
-    FEISHU_ENCRYPT_KEY,
-    FEISHU_VERIFICATION_TOKEN,
-    PORT,
+    FEISHU_APP_ID,
+    FEISHU_APP_SECRET,
     assert_ready,
 )
 from dify import chat as dify_chat
-from feishu import reply_markdown, reply_text
+from feishu import get_user_name, reply_markdown, reply_text
 from feishu_docs import create_doc_from_markdown
 from feishu_sheets import fetch_as_markdown, parse_feishu_link
 
 assert_ready()
-
-app = FastAPI()
 
 # user_id -> {bot_msg_id: {"conv_id", "app_id", "sheet_names", "ts"}}
 # 每条 pending 表示一个等用户回答的澄清问题。机器人发卡片时记录这条卡片的
@@ -35,17 +34,6 @@ PENDING_TTL = 24 * 3600
 # 飞书会重试，按 event_id 去重
 processed_events: dict[str, float] = {}
 DEDUPE_TTL = 300
-
-
-def _decrypt_if_needed(body: dict) -> dict:
-    if "encrypt" not in body:
-        return body
-    if not FEISHU_ENCRYPT_KEY:
-        raise HTTPException(400, "收到加密载荷，但未配置 FEISHU_ENCRYPT_KEY")
-    from crypto import AESCipher
-
-    decrypted = AESCipher(FEISHU_ENCRYPT_KEY).decrypt(body["encrypt"])
-    return json.loads(decrypted)
 
 
 def _is_duplicate(event_id: str) -> bool:
@@ -101,38 +89,6 @@ def _take_single_pending(user_id: str) -> dict | None:
     return None
 
 
-@app.get("/")
-async def root() -> dict:
-    return {"ok": True, "service": "feishu-dify-bot"}
-
-
-@app.post("/webhook")
-async def webhook(request: Request) -> dict:
-    raw = await request.json()
-    body = _decrypt_if_needed(raw)
-
-    if body.get("type") == "url_verification":
-        if body.get("token") != FEISHU_VERIFICATION_TOKEN:
-            raise HTTPException(401, "token 不匹配")
-        return {"challenge": body.get("challenge")}
-
-    header = body.get("header", {})
-    if header.get("token") != FEISHU_VERIFICATION_TOKEN:
-        raise HTTPException(401, "token 不匹配")
-
-    event_id = header.get("event_id", "")
-    if event_id and _is_duplicate(event_id):
-        return {"code": 0}
-
-    if header.get("event_type") == "im.message.receive_v1":
-        try:
-            await _handle_message(body.get("event", {}))
-        except Exception:
-            traceback.print_exc()
-
-    return {"code": 0}
-
-
 async def _handle_message(event: dict) -> None:
     message = event.get("message", {})
     sender = event.get("sender", {})
@@ -143,8 +99,11 @@ async def _handle_message(event: dict) -> None:
     message_id = message.get("message_id", "")
     parent_id = message.get("parent_id", "")
     user_id = sender.get("sender_id", {}).get("open_id", "anonymous")
+    msg_type = message.get("message_type", "")
+    user_name = await get_user_name(user_id)
 
-    if message.get("message_type") != "text":
+    if msg_type != "text":
+        print(f"[bot] msg | user={user_name} | type={msg_type} (ignored)")
         await reply_text(message_id, "目前仅支持文本消息（链接也是文本）。")
         return
 
@@ -152,6 +111,12 @@ async def _handle_message(event: dict) -> None:
     text = content.get("text", "").strip()
     if not text:
         return
+
+    preview = text if len(text) <= 80 else text[:80] + "…"
+    print(
+        f"[bot] msg | user={user_name} | reply={'Y' if parent_id else 'N'} "
+        f"| text={preview!r}"
+    )
 
     parsed = parse_command(text)
 
@@ -406,7 +371,52 @@ async def _continue_conversation(
         await reply_text(message_id, f"调用 Dify 失败：{e}")
 
 
-if __name__ == "__main__":
-    import uvicorn
+# === 长连接事件入口 ===
+# lark-oapi 的事件回调是同步函数，但我们的业务逻辑全是 async（要 await 调
+# 飞书/Dify HTTP API、跑心跳）。开一个独立的 asyncio 事件循环跑在后台线程，
+# 同步回调里只负责把协程调度上去，立刻返回（飞书要求事件 3 秒内 ack）。
+_bg_loop = asyncio.new_event_loop()
 
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
+
+def _start_bg_loop() -> None:
+    asyncio.set_event_loop(_bg_loop)
+    _bg_loop.run_forever()
+
+
+threading.Thread(target=_start_bg_loop, daemon=True).start()
+
+
+def _on_message_received(data: P2ImMessageReceiveV1) -> None:
+    payload = json.loads(lark.JSON.marshal(data))
+    event_id = (payload.get("header") or {}).get("event_id", "")
+    if event_id and _is_duplicate(event_id):
+        return
+    event = payload.get("event") or {}
+    asyncio.run_coroutine_threadsafe(_safe_handle(event), _bg_loop)
+
+
+async def _safe_handle(event: dict) -> None:
+    try:
+        await _handle_message(event)
+    except Exception:
+        traceback.print_exc()
+
+
+def main() -> None:
+    handler = (
+        lark.EventDispatcherHandler.builder("", "")
+        .register_p2_im_message_receive_v1(_on_message_received)
+        .build()
+    )
+    client = lark.ws.Client(
+        FEISHU_APP_ID,
+        FEISHU_APP_SECRET,
+        event_handler=handler,
+        log_level=lark.LogLevel.INFO,
+    )
+    print("[bot] starting long-connection client...")
+    client.start()  # 阻塞，直到进程退出
+
+
+if __name__ == "__main__":
+    main()
