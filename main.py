@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 import traceback
 from datetime import datetime
@@ -24,8 +25,12 @@ assert_ready()
 
 app = FastAPI()
 
-# user_id -> {"last_app": str | None, "conversations": {app_id: conversation_id}}
-user_state: dict[str, dict] = {}
+# user_id -> {bot_msg_id: {"conv_id", "app_id", "sheet_names", "ts"}}
+# 每条 pending 表示一个等用户回答的澄清问题。机器人发卡片时记录这条卡片的
+# message_id；用户用飞书"回复"功能针对它回答时，事件里 parent_id 会指向这条
+# message_id，从而把回答路由到正确的 Dify 会话上——支持同一用户多个分析并发。
+user_state: dict[str, dict[str, dict]] = {}
+PENDING_TTL = 24 * 3600
 
 # 飞书会重试，按 event_id 去重
 processed_events: dict[str, float] = {}
@@ -54,21 +59,46 @@ def _is_duplicate(event_id: str) -> bool:
     return False
 
 
-def _get_user_state(user_id: str) -> dict:
-    return user_state.setdefault(
-        user_id, {"last_app": None, "conversations": {}}
-    )
+def _get_pending(user_id: str) -> dict[str, dict]:
+    pending = user_state.setdefault(user_id, {})
+    now = time.time()
+    for k in list(pending.keys()):
+        if pending[k]["ts"] + PENDING_TTL < now:
+            del pending[k]
+    return pending
 
 
-def _set_user_app(user_id: str, app_id: str, conversation_id: str = "") -> None:
-    state = _get_user_state(user_id)
-    state["last_app"] = app_id
-    if conversation_id:
-        state["conversations"][app_id] = conversation_id
+def _add_pending(
+    user_id: str,
+    bot_msg_id: str,
+    conv_id: str,
+    app_id: str,
+    sheet_names: list[str],
+) -> None:
+    pending = _get_pending(user_id)
+    pending[bot_msg_id] = {
+        "conv_id": conv_id,
+        "app_id": app_id,
+        "sheet_names": sheet_names,
+        "ts": time.time(),
+    }
 
 
-def _get_conv(user_id: str, app_id: str) -> str:
-    return _get_user_state(user_id)["conversations"].get(app_id, "")
+def _resolve_pending(user_id: str, parent_msg_id: str) -> dict | None:
+    """按 parent_msg_id 找到对应会话；找到就 pop 出来。"""
+    pending = _get_pending(user_id)
+    if parent_msg_id and parent_msg_id in pending:
+        return pending.pop(parent_msg_id)
+    return None
+
+
+def _take_single_pending(user_id: str) -> dict | None:
+    """没用 reply 时的兜底：用户恰好只有一个 pending → 直接用它。"""
+    pending = _get_pending(user_id)
+    if len(pending) == 1:
+        bot_msg_id = next(iter(pending))
+        return pending.pop(bot_msg_id)
+    return None
 
 
 @app.get("/")
@@ -111,6 +141,7 @@ async def _handle_message(event: dict) -> None:
         return
 
     message_id = message.get("message_id", "")
+    parent_id = message.get("parent_id", "")
     user_id = sender.get("sender_id", {}).get("open_id", "anonymous")
 
     if message.get("message_type") != "text":
@@ -152,20 +183,39 @@ async def _handle_message(event: dict) -> None:
         )
         return
 
-    # 纯文字 → 走最近一次指令的上下文
-    last_app = _get_user_state(user_id)["last_app"]
-    if not last_app:
-        await reply_text(
-            message_id,
-            "还没有进行中的对话。先用指令开始一个任务，例如：\n"
-            "/调研分析 <表格链接>\n\n"
-            "发送 /help 查看所有指令。",
-        )
+    # 纯文字 → 按 parent_id 路由到对应的 pending 会话
+    entry = _resolve_pending(user_id, parent_id)
+    if not entry:
+        # 没用「回复」功能。如果用户只有一个 pending，直接兜底用上；否则要求 reply。
+        entry = _take_single_pending(user_id)
+
+    if not entry:
+        pending_count = len(_get_pending(user_id))
+        if pending_count == 0:
+            await reply_text(
+                message_id,
+                "还没有进行中的对话。先用指令开始一个任务，例如：\n"
+                "/调研分析 <表格链接>\n\n"
+                "发送 /help 查看所有指令。",
+            )
+        else:
+            await reply_text(
+                message_id,
+                f"你有 {pending_count} 个分析在等回答，请用「回复」功能针对具体的"
+                "问题消息回答。",
+            )
         return
 
     await reply_text(message_id, "正在思考...")
     asyncio.create_task(
-        _continue_conversation(last_app, text, message_id, user_id)
+        _continue_conversation(
+            entry["app_id"],
+            text,
+            message_id,
+            user_id,
+            entry["conv_id"],
+            entry["sheet_names"],
+        )
     )
 
 
@@ -195,7 +245,7 @@ async def _handle_app_command(
             return
         await reply_text(
             message_id,
-            "📊 收到表格链接，正在读取数据并生成调研报告，预计 1-3 分钟。",
+            "📊 收到表格链接，正在读取数据。如果有需要确认的问题，会先和你对一下，再生成报告。",
         )
         asyncio.create_task(_run_analyze(link, message_id, user_id))
         return
@@ -204,14 +254,14 @@ async def _handle_app_command(
     await reply_text(message_id, f"指令 {cmd} 还没接入处理逻辑。")
 
 
-async def _heartbeat(message_id: str, interval: int = 60) -> None:
-    minutes = 0
+async def _heartbeat(message_id: str, interval: int = 300) -> None:
+    elapsed_min = 0
     try:
         while True:
             await asyncio.sleep(interval)
-            minutes += 1
+            elapsed_min += interval // 60
             await reply_text(
-                message_id, f"⏳ 还在生成中... 已等待 {minutes} 分钟"
+                message_id, f"⏳ 还在生成中... 已等待 {elapsed_min} 分钟"
             )
     except asyncio.CancelledError:
         pass
@@ -231,7 +281,7 @@ async def _with_heartbeat(message_id: str, coro):
 
 async def _run_analyze(link: dict, message_id: str, user_id: str) -> None:
     try:
-        sheet_md = await fetch_as_markdown(link)
+        sheet_md, sheet_names = await fetch_as_markdown(link)
         if not sheet_md.strip():
             await reply_text(message_id, "表格读取后内容为空，请检查权限或内容。")
             return
@@ -242,43 +292,115 @@ async def _run_analyze(link: dict, message_id: str, user_id: str) -> None:
             message_id,
             dify_chat(sheet_md, user_id, conversation_id="", api_key=api_key),
         )
-        _set_user_app(user_id, "analyze", new_conv_id)
 
         if not answer.strip():
-            await reply_text(message_id, "Dify 没有返回报告内容。")
+            await reply_text(message_id, "Dify 没有返回内容。")
             return
 
-        title = f"调研报告 {datetime.now().strftime('%Y-%m-%d %H%M')}"
-        try:
-            doc_url = await create_doc_from_markdown(
-                title, answer, share_with_open_id=user_id
+        bot_msg_id = await _send_analyze_answer(
+            answer, message_id, user_id, sheet_names
+        )
+        # 卡片（澄清问题）→ 登记 pending，等用户用「回复」回答
+        if bot_msg_id and new_conv_id:
+            _add_pending(
+                user_id, bot_msg_id, new_conv_id, "analyze", sheet_names
             )
-            await reply_text(message_id, f"📄 报告生成完毕：\n{doc_url}")
-        except Exception as doc_err:
-            traceback.print_exc()
-            await reply_text(
-                message_id,
-                f"⚠️ 飞书文档创建失败（{doc_err}），降级用消息卡片返回报告：",
-            )
-            await reply_markdown(message_id, answer)
     except Exception as e:
         traceback.print_exc()
         await reply_text(message_id, f"处理失败：{e}")
 
 
+def _looks_like_report(answer: str) -> bool:
+    # 有 markdown 标题（# / ## / ### ...）= 报告
+    if re.search(r"^#{1,6}\s", answer, flags=re.MULTILINE):
+        return True
+    # 没标题但很长也按报告处理（兜底）
+    return len(answer) >= 1500
+
+
+async def _send_analyze_answer(
+    answer: str, message_id: str, user_id: str, sheet_names: list[str]
+) -> str | None:
+    """发送 Dify 答复给用户。卡片返回 bot_msg_id，文档返回 None。"""
+    if _looks_like_report(answer):
+        cleaned_answer, title = _normalize_report_title(answer, sheet_names)
+        if not title:
+            title = f"调研报告 {datetime.now().strftime('%Y-%m-%d %H%M')}"
+        doc_url = await create_doc_from_markdown(
+            title, cleaned_answer, owner_open_id=user_id
+        )
+        await reply_text(message_id, f"📄 报告生成完毕：\n{doc_url}")
+        return None
+    # 短回复 / 对话腔 / 含问号 = 澄清问题，用卡片让用户回答
+    return await reply_markdown(message_id, answer)
+
+
+def _build_sheet_strip_re(sheet_names: list[str]) -> re.Pattern:
+    """构造能匹配 'Sheet N' 和具体 sheet 名（含周边连接符空白）的正则。"""
+    parts: list[str] = [r"[Ss]heet\s*\d+"]
+    for name in sheet_names:
+        name = name.strip()
+        if name:
+            parts.append(re.escape(name))
+    pattern = "|".join(parts)
+    return re.compile(rf"\s*[-—–:：]?\s*(?:{pattern})\s*[-—–:：]?\s*")
+
+
+def _strip_sheet_tags(text: str, sheet_names: list[str]) -> str:
+    text = _build_sheet_strip_re(sheet_names).sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip(" -—–:：")
+
+
+def _normalize_report_title(
+    answer: str, sheet_names: list[str]
+) -> tuple[str, str | None]:
+    """提取首个 # 标题并去掉 sheet 字样；返回 (清洗后 markdown, 清洗后标题)。
+
+    标题里和 markdown 里都做替换，确保飞书文档名 = 文档内显示标题。
+    """
+    m = re.search(r"^#\s+(.+?)\s*$", answer, flags=re.MULTILINE)
+    if not m:
+        return answer, None
+    cleaned_title = _strip_sheet_tags(m.group(1), sheet_names)
+    if not cleaned_title:
+        return answer, None
+    new_answer = answer[: m.start(1)] + cleaned_title + answer[m.end(1) :]
+    return new_answer, cleaned_title
+
+
 async def _continue_conversation(
-    app_id: str, text: str, message_id: str, user_id: str
+    app_id: str,
+    text: str,
+    message_id: str,
+    user_id: str,
+    conv_id: str,
+    sheet_names: list[str],
 ) -> None:
     try:
         api_key = DIFY_APPS[app_id]["api_key"]
-        conv_id = _get_conv(user_id, app_id)
         answer, new_conv_id = await _with_heartbeat(
             message_id,
             dify_chat(text, user_id, conversation_id=conv_id, api_key=api_key),
         )
-        if new_conv_id:
-            _set_user_app(user_id, app_id, new_conv_id)
-        await reply_markdown(message_id, answer or "（Dify 未返回内容）")
+
+        if not answer.strip():
+            await reply_text(message_id, "（Dify 未返回内容）")
+            return
+
+        effective_conv_id = new_conv_id or conv_id
+
+        if app_id == "analyze":
+            bot_msg_id = await _send_analyze_answer(
+                answer, message_id, user_id, sheet_names
+            )
+        else:
+            bot_msg_id = await reply_markdown(message_id, answer)
+
+        # 还在追问（又是卡片）→ 重新登记 pending，让下一轮回答能找到这条会话
+        if bot_msg_id and effective_conv_id:
+            _add_pending(
+                user_id, bot_msg_id, effective_conv_id, app_id, sheet_names
+            )
     except Exception as e:
         traceback.print_exc()
         await reply_text(message_id, f"调用 Dify 失败：{e}")

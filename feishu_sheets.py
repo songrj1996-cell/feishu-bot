@@ -174,7 +174,8 @@ def values_to_markdown(values: list[list]) -> str:
     return md
 
 
-async def fetch_as_markdown(link_info: dict) -> str:
+async def fetch_as_markdown(link_info: dict) -> tuple[str, list[str]]:
+    """读取链接对应的内容并转为 markdown，同时返回所读取的 sheet 名列表。"""
     doc_type = link_info["type"]
     token = link_info["token"]
     sheet_id = link_info.get("sheet_id")
@@ -203,9 +204,11 @@ async def fetch_as_markdown(link_info: dict) -> str:
             sheets_to_read = sheets[:1]
 
         parts = []
+        sheet_names: list[str] = []
         for sheet in sheets_to_read:
             sid = sheet["sheet_id"]
             title = sheet.get("title", sid)
+            sheet_names.append(title)
             values = await read_sheet_values(token, sid)
             md = values_to_markdown(values)
             row_count = max(0, len(values) - 1)  # 不含表头
@@ -231,6 +234,6 @@ async def fetch_as_markdown(link_info: dict) -> str:
                 f"'{sheets_to_read[0].get('title')}'；其它未读：{others}"
             )
 
-        return "\n\n".join(parts)
+        return "\n\n".join(parts), sheet_names
 
     raise RuntimeError(f"暂不支持的链接类型：{doc_type}（目前只读取飞书表格/wiki 表格）")

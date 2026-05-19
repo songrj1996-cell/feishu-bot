@@ -30,7 +30,7 @@ async def get_tenant_access_token() -> str:
         return _token_cache["value"]
 
 
-async def reply_text(message_id: str, text: str) -> None:
+async def reply_text(message_id: str, text: str) -> str | None:
     token = await get_tenant_access_token()
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
@@ -47,6 +47,8 @@ async def reply_text(message_id: str, text: str) -> None:
         data = resp.json()
         if data.get("code") != 0:
             print(f"[feishu] reply failed: {data}")
+            return None
+        return data.get("data", {}).get("message_id")
 
 
 # 飞书单条文本约 30K 字符上限，留余量
@@ -79,15 +81,16 @@ def _split_text(text: str, limit: int = LONG_TEXT_LIMIT) -> list[str]:
     return chunks
 
 
-async def reply_long_text(message_id: str, text: str) -> None:
+async def reply_long_text(message_id: str, text: str) -> str | None:
     chunks = _split_text(text)
     if len(chunks) == 1:
-        await reply_text(message_id, chunks[0])
-        return
+        return await reply_text(message_id, chunks[0])
 
     total = len(chunks)
+    last_id: str | None = None
     for i, chunk in enumerate(chunks, 1):
-        await reply_text(message_id, f"（{i}/{total}）\n{chunk}")
+        last_id = await reply_text(message_id, f"（{i}/{total}）\n{chunk}")
+    return last_id
 
 
 def _normalize_for_feishu_md(text: str) -> str:
@@ -95,7 +98,7 @@ def _normalize_for_feishu_md(text: str) -> str:
     return re.sub(r"^(#{1,6})\s+(.+?)\s*$", r"**\2**", text, flags=re.MULTILINE)
 
 
-async def _reply_card(message_id: str, markdown_content: str) -> None:
+async def _reply_card(message_id: str, markdown_content: str) -> str | None:
     token = await get_tenant_access_token()
     card = {
         "config": {"wide_screen_mode": True},
@@ -118,14 +121,17 @@ async def _reply_card(message_id: str, markdown_content: str) -> None:
         data = resp.json()
         if data.get("code") != 0:
             print(f"[feishu] reply card failed: {data}")
+            return None
+        return data.get("data", {}).get("message_id")
 
 
-async def reply_markdown(message_id: str, text: str) -> None:
+async def reply_markdown(message_id: str, text: str) -> str | None:
     chunks = _split_text(text)
     if len(chunks) == 1:
-        await _reply_card(message_id, chunks[0])
-        return
+        return await _reply_card(message_id, chunks[0])
 
     total = len(chunks)
+    last_id: str | None = None
     for i, chunk in enumerate(chunks, 1):
-        await _reply_card(message_id, f"（{i}/{total}）\n\n{chunk}")
+        last_id = await _reply_card(message_id, f"（{i}/{total}）\n\n{chunk}")
+    return last_id
