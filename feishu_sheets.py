@@ -1,9 +1,13 @@
+import asyncio
 import re
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 
 from feishu import FEISHU_BASE, get_tenant_access_token
+
+# 飞书限流错误码（这几个出现时应该退避重试，不是真的写失败）
+_RATE_LIMIT_CODES = {90217, 99991400, 99991401, 99991408, 1310213}
 
 # 匹配飞书/Lark 云文档 URL：sheets / wiki / docx
 FEISHU_URL_RE = re.compile(
@@ -72,13 +76,133 @@ async def get_sheet_meta(spreadsheet_token: str, sheet_id: str) -> dict:
         return data["data"]["sheet"]
 
 
-def _col_to_letter(col_idx: int) -> str:
+def col_to_letter(col_idx: int) -> str:
     """1-based 列号 → 字母（1=A, 27=AA）。"""
     result = ""
     while col_idx > 0:
         col_idx, rem = divmod(col_idx - 1, 26)
         result = chr(65 + rem) + result
     return result
+
+
+async def insert_columns(
+    spreadsheet_token: str, sheet_id: str, start_index: int, count: int = 1
+) -> None:
+    """在 sheet 的 start_index（0-based）位置插入 count 列。失败抛 RuntimeError。"""
+    access = await get_tenant_access_token()
+    body = {
+        "dimension": {
+            "sheetId": sheet_id,
+            "majorDimension": "COLUMNS",
+            "startIndex": start_index,
+            "endIndex": start_index + count,
+        }
+    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/insert_dimension_range",
+            headers={
+                "Authorization": f"Bearer {access}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json=body,
+        )
+        result = resp.json()
+        if result.get("code") != 0:
+            raise RuntimeError(f"插入列失败: {result}")
+
+
+async def write_cell(
+    spreadsheet_token: str,
+    sheet_id: str,
+    cell_range: str,
+    value,
+    max_retries: int = 4,
+) -> bool:
+    """写一个单元格区域。cell_range 形如 'A1' 或 'A1:A1'。失败返回 False（不抛异常）。
+
+    飞书要求 range 必须是闭区间（"A1:A1"）；如果传进来是单格（"A1"），自动补成 "A1:A1"。
+    遇到限流错误码（90217 等）会指数退避重试，避免行级并发把飞书打到限流。
+    """
+    if ":" not in cell_range:
+        cell_range = f"{cell_range}:{cell_range}"
+    body = {
+        "valueRange": {
+            "range": f"{sheet_id}!{cell_range}",
+            "values": [[value]],
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        for attempt in range(max_retries):
+            access = await get_tenant_access_token()
+            try:
+                resp = await client.put(
+                    f"{FEISHU_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values",
+                    headers={
+                        "Authorization": f"Bearer {access}",
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                    json=body,
+                )
+                result = resp.json()
+                code = result.get("code", 0)
+                if code == 0:
+                    return True
+                if code in _RATE_LIMIT_CODES:
+                    wait = min(2 ** attempt, 8)
+                    print(
+                        f"[feishu_sheets] write_cell rate-limited (code={code}); "
+                        f"retry in {wait}s ({attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                # 非限流类业务错误：不重试，直接报失败
+                print(f"[feishu_sheets] write_cell failed: {result}")
+                return False
+            except Exception as e:
+                wait = min(2 ** attempt, 8)
+                print(f"[feishu_sheets] write_cell exc: {e}; retry in {wait}s")
+                await asyncio.sleep(wait)
+    print(f"[feishu_sheets] write_cell retry exhausted ({cell_range})")
+    return False
+
+
+async def fetch_raw_rows(link_info: dict) -> tuple[str, str, str, list[list]]:
+    """读取链接对应的 sheet，返回 (spreadsheet_token, sheet_id, sheet_title, rows)。
+
+    rows 是原始的 list[list]，第 0 行是表头。/反馈打标 这种需要逐行处理 + 写回的
+    场景用这个，不要走 fetch_as_markdown（那个是为 LLM 输入准备的）。
+    """
+    doc_type = link_info["type"]
+    token = link_info["token"]
+    sheet_id_q = link_info.get("sheet_id")
+
+    if doc_type == "wiki":
+        resolved = await resolve_wiki_node(token)
+        if resolved["obj_type"] != "sheet":
+            raise RuntimeError(
+                f"Wiki 节点是 {resolved['obj_type']}，不是表格"
+            )
+        token = resolved["obj_token"]
+        doc_type = "sheets"
+
+    if doc_type != "sheets":
+        raise RuntimeError(f"暂不支持的链接类型：{doc_type}（需要飞书表格）")
+
+    sheets = await list_sheets(token)
+    if not sheets:
+        raise RuntimeError("表格里没有 sheet")
+
+    chosen = None
+    if sheet_id_q:
+        chosen = next((s for s in sheets if s["sheet_id"] == sheet_id_q), None)
+    chosen = chosen or sheets[0]
+
+    sid = chosen["sheet_id"]
+    title = chosen.get("title", sid)
+    rows = await read_sheet_values(token, sid)
+    return token, sid, title, rows
 
 
 async def read_sheet_values(
@@ -93,7 +217,7 @@ async def read_sheet_values(
     if row_count <= 0 or col_count <= 0:
         return []
 
-    end_col = _col_to_letter(col_count)
+    end_col = col_to_letter(col_count)
     access = await get_tenant_access_token()
     all_values: list[list] = []
 

@@ -5,33 +5,43 @@ load_dotenv()
 
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
-FEISHU_VERIFICATION_TOKEN = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
-FEISHU_ENCRYPT_KEY = os.getenv("FEISHU_ENCRYPT_KEY", "")
 
 DIFY_API_BASE = os.getenv("DIFY_API_BASE", "https://api.dify.ai/v1").rstrip("/")
+# 老变量保留为 dify.chat() 的默认 fallback；新流程下 main.py 都显式传 api_key，
+# 这个 var 已经没有强约束，留空也行。
 DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
+# /调研分析 重构后用两个 chat 应用：
+#   planner  → 读表头+样本，输出 plan JSON（哪些是画像/单选/多选/量表/开放题，怎么分 part，怎么交叉）
+#   analyst  → 同一会话先按 part 写报告，conv_id 留下来给后续 QA 复用（节省 token）
+DIFY_PLANNER_KEY = os.getenv("DIFY_PLANNER_KEY", "")
+DIFY_ANALYST_KEY = os.getenv("DIFY_ANALYST_KEY", "")
+# /反馈打标（completion-messages 一次性请求，分两个应用：探路者识列 + 干活者打标）
+DIFY_LLM1_KEY = os.getenv("DIFY_LLM1_KEY", "")
+DIFY_LLM2_KEY = os.getenv("DIFY_LLM2_KEY", "")
 
-# 各业务对应的 Dify Chatbot。新增功能：1) 在 Dify 建新 Chatbot；
-# 2) .env 加新的 KEY；3) 在 DIFY_APPS 加一项；4) 在 COMMAND_TO_APP 加映射。
+# 各业务对应的 Dify 应用。每个 app 的字段形态不同（analyze 拆 planner+analyst，
+# tagging 是探路者+干活者），由对应的 _run_xxx 函数自己解读。
 DIFY_APPS: dict[str, dict] = {
     "analyze": {
         "name": "调研分析",
-        "api_key": DIFY_API_KEY,
+        "planner_key": DIFY_PLANNER_KEY,  # 列分类规划
+        "analyst_key": DIFY_ANALYST_KEY,  # 首轮写报告 + 后续 QA 共用同一应用同一 conv_id
     },
-    # 示例（未来扩展时取消注释）：
-    # "code": {"name": "代码助手", "api_key": os.getenv("DIFY_API_KEY_CODE", "")},
-    # "translate": {"name": "翻译助手", "api_key": os.getenv("DIFY_API_KEY_TRANSLATE", "")},
+    "tagging": {
+        "name": "反馈打标",
+        "explorer_key": DIFY_LLM1_KEY,  # 探路者：识别表头中需要打标的列号
+        "worker_key": DIFY_LLM2_KEY,    # 干活者：拿到一行数据 → 返回每列的标签 + 翻译
+    },
 }
 
 # 用户输入的指令 → Dify 应用 id
 COMMAND_TO_APP: dict[str, str] = {
     "/调研分析": "analyze",
-    # "/code": "code",
-    # "/translate": "translate",
+    "/反馈打标": "tagging",
 }
 
-PORT = int(os.getenv("PORT", "8000"))
-
+# /反馈打标 行级并发上限（避免打 Dify 太狠）
+TAGGING_CONCURRENCY = int(os.getenv("TAGGING_CONCURRENCY", "5"))
 
 def assert_ready() -> None:
     missing = [
@@ -39,8 +49,10 @@ def assert_ready() -> None:
         for name, val in {
             "FEISHU_APP_ID": FEISHU_APP_ID,
             "FEISHU_APP_SECRET": FEISHU_APP_SECRET,
-            "FEISHU_VERIFICATION_TOKEN": FEISHU_VERIFICATION_TOKEN,
-            "DIFY_API_KEY": DIFY_API_KEY,
+            "DIFY_PLANNER_KEY": DIFY_PLANNER_KEY,
+            "DIFY_ANALYST_KEY": DIFY_ANALYST_KEY,
+            "DIFY_LLM1_KEY": DIFY_LLM1_KEY,
+            "DIFY_LLM2_KEY": DIFY_LLM2_KEY,
         }.items()
         if not val
     ]
